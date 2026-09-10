@@ -1,0 +1,20 @@
+services:
+  db:
+    image: postgres:16
+    container_name: revass-db
+    environment:
+      POSTGRES_DB: revass
+      POSTGRES_USER: revass
+      POSTGRES_PASSWORD: revass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U revass -d revass"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
