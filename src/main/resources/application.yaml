@@ -1,3 +1,23 @@
 spring:
   application:
     name: revenue-assurance
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/revass
+    username: revass
+    password: revass
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+
+logging:
+  level:
+    org.hibernate.SQL: debug
