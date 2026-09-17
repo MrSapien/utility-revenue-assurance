@@ -11,8 +11,8 @@
 	<groupId>io.github.mrsapien</groupId>
 	<artifactId>revenue-assurance</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<name/>
-	<description/>
+	<name>revenue-assurance</name>
+	<description>Revenue assurance for metered network delivery</description>
 	<url/>
 	<licenses>
 		<license/>
