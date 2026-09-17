@@ -193,3 +193,142 @@ explicitly where it is needed rather than inherited from a default.
   production.
 - Domain enums stored as `TEXT` with constraints in code, not
   PostgreSQL enum types, which are painful to alter.
+
+---
+
+## Problems hit, and how I read them
+
+### Reading a Java stack trace
+
+Four exceptions nested by `Caused by`. **Read from the bottom** — the
+last `Caused by` is the root cause and everything above it is Spring
+wrapping the failure as it bubbled up.
+
+The `~[jar-name]` tag on each frame says which library it came from. My
+own code is tagged `~[classes/:na]`, and in a real bug that is usually
+the line I want.
+
+Three connection failures that look similar and mean different things:
+
+| Message | Means |
+|---|---|
+| `Connection refused` | nothing is listening on that port |
+| timeout | something is there but not answering — usually a firewall |
+| `authentication failed` | the server is up and rejected my credentials |
+
+### The application started before the database
+
+`Connection refused` at `localhost:5432` — the container had stopped on
+a machine restart. `docker compose up -d` and wait for `(healthy)`.
+
+The trace was worth keeping for a different reason: it showed
+`entityManagerFactory` depending on `flywayInitializer`. Spring Boot
+wires that deliberately, so **migrations always run before Hibernate
+validates**. Without that ordering, `ddl-auto: validate` would check
+entities against a schema that didn't exist yet — D4 depends on it.
+
+### `invalid value for parameter "TimeZone": "Asia/Calcutta"`
+
+The JDBC driver sends the JVM's default zone as a connection parameter.
+Java on Windows reports the Indian zone under its legacy alias; the
+Debian-based `postgres:16` image no longer ships tzdata's
+backward-compatibility links. Fixed as D8 — the whole application runs
+in UTC.
+
+### The JDK version was different in four places
+
+Windows `JAVA_HOME`, the PATH, IntelliJ's project SDK and language
+level, IntelliJ's Maven importer, and `<java.version>` in the pom. All
+of them can disagree, and the symptom is code that compiles in the IDE
+and fails in `mvnw`, or passes locally and breaks in CI.
+
+Diagnosis: `where.exe java` shows what the PATH resolves to;
+`& "$env:JAVA_HOME\bin\java.exe" --version` shows what `JAVA_HOME`
+names. When those two disagree, that is the bug.
+
+Two things that made it confusing. Environment variables are read at
+**process start**, so an open terminal — including IntelliJ's, which
+inherits IntelliJ's environment — keeps stale values until a full
+restart. And IntelliJ had silently downloaded its own JDK, independent
+of anything in the Windows environment.
+
+The pom is the one that matters for CI; it is the only one a build
+server reads.
+
+---
+
+## Things I had to get straight
+
+**Why do most dependencies have no `<version>`?**
+`spring-boot-starter-parent` pins a tested set of versions for hundreds
+of libraries. I inherit that rather than picking my own.
+
+**What does `mvn verify` do that `mvn compile` doesn't?**
+Maven phases run in order, and naming one runs everything before it —
+validate, compile, test, package, verify. That is why CI runs one
+command.
+
+**Why would a controller in the wrong package 404 instead of erroring?**
+`@SpringBootApplication` scans its own package downwards only. A class
+outside it is invisible to Spring — no bean, no route, no error.
+
+**Image vs container vs volume.**
+Image is a read-only template, container is an instance with a thin
+writable layer, volume is storage Docker manages outside the container's
+lifecycle. `docker compose down` destroys the container, keeps the
+volume. Only `down -v` deletes the data.
+
+**Why did changing `POSTGRES_PASSWORD` do nothing?**
+The image reads those variables only when initialising an **empty** data
+directory. An existing volume means the entrypoint skips initialisation
+entirely. Change it in SQL, or `down -v` and start clean.
+
+**Which side of `"5432:5432"` is mine?**
+The left. Map `"5433:5432"` and Postgres still listens on 5432 inside,
+but my JDBC URL has to say 5433.
+
+**Does `connection.close()` close the connection?**
+No. HikariCP hands out a proxy; `close()` returns it to the pool. The
+socket stays open for the life of the application. That is why pool
+size, not connection setup cost, is what caps concurrent queries.
+
+**`TEXT` or `VARCHAR(n)`?**
+In PostgreSQL they are stored and perform identically; `VARCHAR(n)` just
+adds a length check. `TEXT` unless the length is a real business rule.
+
+**Why `CHECK (valid_to IS NULL OR valid_to > valid_from)` and not just
+the comparison?**
+A comparison against null is *unknown*, not false, and `CHECK` only
+rejects a row when the expression is definitively false. The same
+three-valued logic bites in queries: `WHERE x != 5` silently excludes
+rows where x is null.
+
+**Why name constraints?**
+The violation error quotes the name. Unnamed, Postgres invents
+`table_check1`, which tells me nothing when a table has four checks.
+
+**Why does `parent_id` need an explicit index when `id` doesn't?**
+A primary key gets its index automatically. PostgreSQL does **not**
+index foreign key columns, which makes parent lookups and joins slow
+until I add one. Every tree walk in the balance engine runs that index.
+
+**Why is `valid_from` in the unique index?**
+`(utility_id, code)` alone would mean a node can exist only once in
+history. Effective dating needs the same code to appear more than once —
+a superseding correction, or a decommissioned code reissued.
+
+**Why UUID and not `BIGSERIAL`?**
+A sequential key needs a database round trip to learn an entity's
+identity and leaks the row count. UUIDs are generated in application
+code, which matters once ingestion is batched. The cost is a wider
+index.
+
+**Why is the tree not a structure in the database?**
+It is one flat table with a column pointing back at itself. Direct
+children are one indexed lookup; everything beneath a node at unknown
+depth is not, and needs a recursive CTE.
+
+**What does `revass-#` mean in psql?**
+The trailing dash means psql is mid-statement, waiting for a semicolon.
+`;` submits what is buffered, `\r` throws it away. Backslash for psql
+commands — `\dt`, `\d`, `\l`, `\q` — never a forward slash.
