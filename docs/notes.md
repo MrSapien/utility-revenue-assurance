@@ -183,6 +183,164 @@ explicitly where it is needed rather than inherited from a default.
 
 ---
 
+### D9 — Integration tests run against real PostgreSQL, not an in-memory database
+
+Testcontainers starts `postgres:16` — the same image as the compose file
+— applies my Flyway migrations to an empty database, boots the full
+Spring context, and destroys the container when the JVM exits.
+
+The usual alternative is H2 in memory, on the grounds that it is fast
+and needs no setup. It would mean testing against a database I don't
+deploy, and the differences land exactly where this system's
+correctness lives: UUID and `JSONB` handling, recursive CTEs, window
+functions, `FOR UPDATE SKIP LOCKED`, `pg_trgm`, and — the one that
+matters most — locking and isolation semantics. The concurrency work
+later, proving two payments on one account cannot lose an update, is
+meaningless against a database with different locking behaviour. My
+migrations might not even run on H2, which would mean maintaining two
+schemas and testing the one I don't ship.
+
+The cost is seconds per run instead of milliseconds. For a system whose
+whole argument is correctness, that isn't close.
+
+Three things worth knowing about how it works:
+
+- **The port is random**, not 5432, because the compose database already
+  holds that port and parallel test runs would collide. `@ServiceConnection`
+  (Spring Boot 3.1+) wires the container's URL and credentials into
+  Spring, so nothing is hardcoded. Older tutorials use a
+  `@DynamicPropertySource` block for this; it isn't wrong, just twelve
+  lines where three will do.
+- **The container field is `static`**, so it starts once per test class
+  rather than once per test method.
+- **Ryuk** is a sidecar container Testcontainers starts first, whose only
+  job is to kill the containers it created when the JVM exits. That is
+  why nothing lingers after a crashed run and why I write no cleanup
+  code.
+
+The guarantee this buys: every test run builds the schema from scratch
+by applying the migrations. A broken migration fails the build rather
+than surfacing on a fresh deploy.
+
+---
+
+### D10 — Uttar Pradesh for both the tariff schedule and net metering
+
+The tariff engine follows UPPCL's categories under UPERC's tariff order,
+and prosumer billing follows UPERC's rooftop solar regulations.
+
+The reason is coherence rather than convenience. The evidence this
+project is built on is a CEEW study of a UP feeder — the 42% loss
+figure, the arrears concentration, the table billing, the unassigned
+readers. If the tariff engine priced in another state's slabs while the
+generator reproduced a UP feeder's problems, the project would quietly
+describe two different places.
+
+UP also exercises the parts that matter: telescopic domestic slabs, a
+rural/urban split, a large base of unmetered agricultural connections
+(which makes normative billing a real requirement), and one of the
+largest prepaid smart-meter rollouts.
+
+*Trade-off accepted:* Delhi's and Maharashtra's tariff orders are cleaner
+documents. I'm trading document quality for one consistent world.
+
+*Deliberately not done yet:* fetching the actual rates. Tariff orders
+are reissued every year and rating isn't built until later, so I take
+the order in force then. What I need now is only the category names,
+because they become enum values.
+
+Both are versioned data by design, so another state is a data change,
+not a code change.
+
+---
+
+### D11 — The code is divided into layers, and dependencies only point down
+
+The system is one deployable application, but the code inside it is
+split into areas, and I've written down which may use which. The rule is
+simple: **an area can use the ones below it, never the ones above.**
+
+| Layer | Areas |
+|---|---|
+| api | controllers, request/response shapes, error handling |
+| workflow | `casework`, `notification` |
+| money | `billing`, `prepaid`, `supply` |
+| derivation | `balance`, `tariff` |
+| facts | `reading` |
+| state | `registry`, `ledger` |
+| foundation | `common` |
+
+Full detail in `docs/module-map.md`. Four choices in it are deliberate.
+
+**The ledger knows nothing about electricity.** No meters, no units, no
+transformers — just amounts, accounts, and the rule that the two sides
+of every entry balance. Billing tells it what to record. This is what
+lets me test the money rules on their own: throw thousands of random
+money movements at it and check the books still balance, without
+building an electricity network first.
+
+**Casework and notification are reached only through announcements,
+never direct calls.** Almost every area needs to raise a case. If they
+called casework directly, and casework needed to look at readings to
+describe the problem, the two would point at each other. So areas
+announce what happened, with enough detail to explain it, and casework
+listens. That also forces every case to carry its own evidence — which
+the project requires anyway, since an accusation must be explainable to
+the person it's about. A practical constraint and a moral one landing on
+the same answer is usually a sign the line is in the right place.
+
+**Prepaid depends on supply, not the reverse.** Prepaid decides whether
+to cut someone off; supply just carries the instruction. The messenger
+shouldn't know why.
+
+**The registry depends only on `common`**, which is why it is built
+first.
+
+This map will turn out wrong somewhere — most likely around conversion
+factors, which both balance and tariff use. When it does, I change the
+map and record here what I learned.
+
+---
+
+### D12 — A customer's connection is not a node in the network tree
+
+The network tree stops at the distribution transformer. A connection is
+its own record, linked to a transformer by a separate table.
+
+The obvious design would give a connection a `parent_id` pointing at its
+transformer, like every other level. I didn't, because **which
+transformer a connection belongs to is a claim, and the claim is often
+wrong.** In the CEEW feeder, 8% of consumers were tagged to the wrong
+feeder and around 40% weren't mapped to any transformer at all. That
+link gets disputed, checked in the field, and corrected — sometimes
+after a loss figure has already been published using the wrong answer.
+
+A `parent_id` column holds one answer and forgets what it used to say.
+The link needs its own history, with both the date it became true and
+the date the system learned it. That is exactly the shape D7 describes.
+
+---
+
+### D13 — Enums are stored by name; dates use `java.time`
+
+**`@Enumerated(EnumType.STRING)` on every enum field.** Hibernate's
+default stores an enum's position number — the first value is 0, the
+second 1. Insert a new value near the top and every stored number
+silently changes meaning. Storing the name avoids that.
+
+The consequence I have to respect: **the name is now the data.** A typo
+in an enum value gets written into every row. I caught one before any
+data existed — `ElECTRICITY`, with a lowercase `l` — which would have
+cost a migration to fix later.
+
+**`LocalDate` and the other `java.time` types, never `java.sql.Date`.**
+The old type secretly carries a time as well and converts it using the
+machine's time zone — the same machine-dependent behaviour D8 exists to
+remove. `LocalDate` is a date and nothing else.
+
+
+---
+
 ## Conventions
 
 - Half-open intervals everywhere. See D5.
@@ -193,6 +351,17 @@ explicitly where it is needed rather than inherited from a default.
   production.
 - Domain enums stored as `TEXT` with constraints in code, not
   PostgreSQL enum types, which are painful to alter.
+- Enum fields always `@Enumerated(EnumType.STRING)`. See D13.
+- Dates are `java.time` — `LocalDate`, `Instant`. Never `java.sql.*`.
+- Java fields in camelCase (`validFrom`); columns in snake_case
+  (`valid_from`). Spring converts between them, so column names are only
+  written out when they genuinely differ.
+- Relationships are always `fetch = LAZY`. Loading one transformer must
+  not load the whole chain above it.
+- Entity constructors take enums, not strings, so a wrong value is a
+  compile error rather than a runtime crash.
+- Every entity has a `protected` no-argument constructor for Hibernate,
+  and a real constructor that generates the id.
 
 ---
 
@@ -255,80 +424,103 @@ of anything in the Windows environment.
 The pom is the one that matters for CI; it is the only one a build
 server reads.
 
----
+### Tutorials and generated code lag the version I'm on
 
-## Things I had to get straight
+Spring Boot 4 and Testcontainers 2 renamed and restructured enough that
+most material written for Spring Boot 3 / Testcontainers 1 is subtly
+wrong:
 
-**Why do most dependencies have no `<version>`?**
-`spring-boot-starter-parent` pins a tested set of versions for hundreds
-of libraries. I inherit that rather than picking my own.
+| Older API | What I actually use |
+|---|---|
+| `spring-boot-starter-web` | `spring-boot-starter-webmvc` |
+| one fat `spring-boot-starter-test` | per-starter test companions — `...-data-jpa-test`, `...-flyway-test`, `...-webmvc-test` |
+| `org.testcontainers:postgresql` | `org.testcontainers:testcontainers-postgresql` |
+| `org.testcontainers.containers.PostgreSQLContainer` | `org.testcontainers.postgresql.PostgreSQLContainer` |
+| `PostgreSQLContainer<?>` — self-referential generic | **not generic in 2.x** — the raw type is correct |
 
-**What does `mvn verify` do that `mvn compile` doesn't?**
-Maven phases run in order, and naming one runs everything before it —
-validate, compile, test, package, verify. That is why CI runs one
-command.
+The habit: when the compiler and an article disagree, check the
+article's version before assuming I made the mistake. *Type does not
+have type parameters* is the compiler being precise, not confused.
 
-**Why would a controller in the wrong package 404 instead of erroring?**
-`@SpringBootApplication` scans its own package downwards only. A class
-outside it is invisible to Spring — no bean, no route, no error.
+### Noted for later — Mockito self-attaching
 
-**Image vs container vs volume.**
-Image is a read-only template, container is an instance with a thin
-writable layer, volume is storage Docker manages outside the container's
-lifecycle. `docker compose down` destroys the container, keeps the
-volume. Only `down -v` deletes the data.
+```
+Mockito is currently self-attaching to enable the inline-mock-maker.
+This will no longer work in future releases of the JDK.
+```
 
-**Why did changing `POSTGRES_PASSWORD` do nothing?**
-The image reads those variables only when initialising an **empty** data
-directory. An existing volume means the entrypoint skips initialisation
-entirely. Change it in SQL, or `down -v` and start clean.
+Java is tightening dynamic agent loading. Harmless while nothing uses
+Mockito; when I start mocking, it becomes a `-javaagent` line in the
+surefire config.
 
-**Which side of `"5432:5432"` is mine?**
-The left. Map `"5433:5432"` and Postgres still listens on 5432 inside,
-but my JDBC URL has to say 5433.
+### Two guards, and which one catches what
 
-**Does `connection.close()` close the connection?**
-No. HikariCP hands out a proxy; `close()` returns it to the pool. The
-socket stays open for the life of the application. That is why pool
-size, not connection setup cost, is what caps concurrent queries.
+When I broke `NetworkNode` on purpose, the first attempt never reached
+the database. I'd changed a field to `String` but left the constructor
+and getter as `LocalDate`, so the **compiler** refused. The compiler
+only knows about Java — it can catch "a date going into a text field",
+but it has no idea what's in the database.
 
-**`TEXT` or `VARCHAR(n)`?**
-In PostgreSQL they are stored and perform identically; `VARCHAR(n)` just
-adds a length check. `TEXT` unless the length is a real business rule.
+Making the Java consistent but wrong against the table got past the
+compiler, and then **Hibernate's startup check** caught it:
 
-**Why `CHECK (valid_to IS NULL OR valid_to > valid_from)` and not just
-the comparison?**
-A comparison against null is *unknown*, not false, and `CHECK` only
-rejects a row when the expression is definitively false. The same
-three-valued logic bites in queries: `WHERE x != 5` silently excludes
-rows where x is null.
+```
+Schema validation: wrong column type encountered in column [valid_from]
+in table [network_node]; found [date], but expecting [varchar(255)]
+```
 
-**Why name constraints?**
-The violation error quotes the name. Unnamed, Postgres invents
-`table_check1`, which tells me nothing when a table has four checks.
+`found` is the database; `expecting` is what Java wanted. `varchar(255)`
+is Hibernate's default guess for a `String`.
 
-**Why does `parent_id` need an explicit index when `id` doesn't?**
-A primary key gets its index automatically. PostgreSQL does **not**
-index foreign key columns, which makes parent lookups and joins slow
-until I add one. Every tree walk in the balance engine runs that index.
+The order matters: compiler first, then the schema check at startup,
+then runtime. Each catches a kind of mistake the one before it can't
+see. Having watched the second one fire, I can trust it without
+thinking about it.
 
-**Why is `valid_from` in the unique index?**
-`(utility_id, code)` alone would mean a node can exist only once in
-history. Effective dating needs the same code to appear more than once —
-a superseding correction, or a decommissioned code reissued.
+### Finding the one useful line in a huge log
 
-**Why UUID and not `BIGSERIAL`?**
-A sequential key needs a database round trip to learn an entity's
-identity and leaks the row count. UUIDs are generated in application
-code, which matters once ingestion is batched. The cost is a wider
-index.
+A startup failure produced about 400 lines. Most of it was a block
+headed **CONDITIONS EVALUATION REPORT** — Spring listing every automatic
+setup it considered and why each did or didn't switch on. Useful for a
+different kind of problem, noise for this one.
 
-**Why is the tree not a structure in the database?**
-It is one flat table with a column pointing back at itself. Direct
-children are one indexed lookup; everything beneath a node at unknown
-depth is not, and needs a recursive CTE.
+Two habits get straight to the answer:
 
-**What does `revass-#` mean in psql?**
-The trailing dash means psql is mid-statement, waiting for a semicolon.
-`;` submits what is buffered, `\r` throws it away. Backslash for psql
-commands — `\dt`, `\d`, `\l`, `\q` — never a forward slash.
+- **Search for `Caused by` and take the last one.** The bottom-most
+  cause is the real one.
+- **Search for a word that describes the likely problem** —
+  `Schema validation`, `Connection refused`, `TimeZone`.
+
+Nobody reads these top to bottom.
+
+### Mapping a relationship: the parent is an object, not an id
+
+My first `NetworkNode` got the parent mapping wrong in three ways at
+once, all from one misunderstanding:
+
+```java
+@ManyToOne(fetch = FetchType.LAZY)
+@JoinColumn(name = "id")          // wrong column
+@Column(nullable = false)         // can't combine, and the root has no parent
+private UUID parent_id;           // should be the object, not its id
+```
+
+In the database a parent is an id in the `parent_id` column. In Java a
+parent is **another `NetworkNode`**. Translating between those two is
+exactly Hibernate's job, so the field type is `NetworkNode`.
+
+`@JoinColumn(name = ...)` names the column **in this table** that holds
+the link — `parent_id` — not the column it points at. Naming `id` would
+have mapped the primary key twice.
+
+The parent is nullable, because the substation at the top has none. And
+`@Column` never goes on a relationship; `@JoinColumn` already does that
+job.
+
+Correct version:
+
+```java
+@ManyToOne(fetch = FetchType.LAZY)
+@JoinColumn(name = "parent_id")
+private NetworkNode parent;
+```
