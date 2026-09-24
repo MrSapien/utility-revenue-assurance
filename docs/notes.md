@@ -524,3 +524,42 @@ Correct version:
 @JoinColumn(name = "parent_id")
 private NetworkNode parent;
 ```
+
+### A repository test that couldn't fail
+
+Hibernate keeps every object it saves or loads in memory for the rest of
+the transaction. Asking for one again returns the same object without
+touching the database.
+
+So a test that saves a node and immediately reads it back passes even if
+the database mapping is broken. I proved it: with `entityManager.clear()`
+removed, my tree test still went green, but the parent it walked up to
+was the Java object I'd built in the test, never read back from
+PostgreSQL. If `parent_id` were saved wrong, that test would still have
+passed.
+
+Every repository test now calls `flush()` (send pending writes) then
+`clear()` (forget everything in memory) before reading back, so the read
+has to make a real round trip. The general rule I took from it: *if my
+code were broken, would this go red?* If not, the test is decoration.
+
+The SQL log made the rest visible too. The three INSERTs appeared
+together at `flush()`, not at each `save()`, and the parent SELECTs
+came from my assert lines rather than from `findById` — lazy loading
+fetching each parent only when something actually used it.
+
+### Open issue: a SELECT before every save
+
+The same log showed a SELECT by id before each INSERT. Spring Data
+decides whether an entity is new by checking whether its id is null. My
+ids are generated in the constructor (see the UUID choice under the network_node table), so
+every entity arrives with one set, Spring can't tell it's new, and it
+checks the database first.
+
+Two costs. Every save is two round trips instead of one — negligible
+now, significant once meter readings are ingested in bulk. And on that
+path `save()` returns a different instance from the one passed in,
+leaving the original detached, so later changes to it would be silently
+lost.
+
+Fix pending: the entity will tell Spring directly whether it's new.
